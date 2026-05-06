@@ -9,7 +9,7 @@ Hey team, here is the proposed REST API design and contract for the new campus n
 Based on the requirements, the platform needs to handle these main actions:
 
 1. **Fetch Notifications**: Get a list of notifications for the logged-in user. We'll definitely need pagination here, plus filters for category (`Placements`, `Events`, `Results`) and read/unread status.
-2. **Mark as Read**: A simple toggle when a student clicks or views a specific notification.
+2. **Mark as Read**: A simple toggle when a student clicks or views a specific notifications.
 3. **Mark All as Read**: A bulk update so users can clear their unread queue in one click.
 4. **Get Unread Count**: A lightweight endpoint just to fetch the total unread number (useful for the little red notification badge in the UI).
 5. **Create Notification (Admin)**: An endpoint for admins to blast out new alerts to specific batches or departments.
