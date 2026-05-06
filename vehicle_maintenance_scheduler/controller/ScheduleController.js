@@ -1,15 +1,20 @@
 const scheduleRepo = require('../repositories/ScheduleRepo');
+const { Log } = require('../../logging_middleware');
 
 class ScheduleController {
     async generateSchedule(req, res) {
+        Log('backend', 'info', 'handler', 'Received incoming request to generate vehicle maintenance schedule');
+        
         try {
             const [budget, tasks] = await Promise.all([
                 scheduleRepo.fetchBudget(),
                 scheduleRepo.fetchTasks()
             ]);
 
+            Log('backend', 'debug', 'handler', `Starting 0/1 Knapsack optimization algorithm with a budget of ${budget} hours across ${tasks.length} tasks`);
             const schedule = this.optimizeSchedule(tasks, budget);
             
+            Log('backend', 'info', 'handler', `Schedule generated successfully resulting in a max impact score of ${schedule.maxImpact}`);
             res.status(200).json({
                 budget,
                 totalTasksAvailable: tasks.length,
@@ -17,6 +22,7 @@ class ScheduleController {
                 scheduledTasks: schedule.scheduledTasks
             });
         } catch (error) {
+            Log('backend', 'error', 'handler', `Failure during schedule generation execution: ${error.message}`);
             res.status(500).json({ error: error.message });
         }
     }
