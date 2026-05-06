@@ -1,8 +1,6 @@
-de# Stage 1
+## Stage 1
 
 ## Campus Notification Platform - API Contract & System Design
-
-Hey team, here is the proposed REST API design and contract for the new campus notification system. I've broken down the core features we need and the endpoint structures to handle them.
 
 ### 1. Core Actions
 
@@ -192,3 +190,110 @@ When an admin creates a notification, the backend determines the `target_audienc
 ```
 
 *Alternative mechanism:* **Server-Sent Events (SSE)** could also be considered if bidirectional communication (like the client sending 'typing' events) is not required, as SSE is simpler and natively supports unidirectional server-to-client event streaming over standard HTTP.
+
+---
+
+## Stage 2
+
+### Database Selection
+
+For this notification system, I recommend using **PostgreSQL**, a robust relational database. 
+
+**Key Features**
+- **ACID Compliance**: It guarantees reliable state transitions, which is crucial when thousands of students are simultaneously marking notifications as read or clearing their inboxes. We cannot afford data anomalies.
+- **Relational Structure**: The platform inherently maps entities (users to their specific notifications). A relational database handles these associations naturally and efficiently.
+- **Flexible JSONB Support**: Notifications can have varying metadata (e.g., dynamic `target_audience` parameters or custom `action_url` structures). PostgreSQL's `JSONB` data type allows us to store these attributes without strict schemas while still keeping them fully indexable and queryable.
+
+### Database Schema
+
+We'll use a "fan-out-on-write" approach. Instead of keeping an array of users inside a single notification, we'll have a main table for the notification content and a mapping table that acts as each user's personal inbox.
+
+**1. `notifications` Table:** (Stores the actual broadcasted message)
+- `id` (UUID, Primary Key)
+- `title` (VARCHAR)
+- `message` (TEXT)
+- `category` (VARCHAR)
+- `action_url` (VARCHAR, Nullable)
+- `target_audience` (JSONB)
+- `created_at` (TIMESTAMP, Default: CURRENT_TIMESTAMP)
+
+**2. `user_notifications` Table:** (Tracks individual read receipts and acts as the user's feed)
+- `id` (UUID, Primary Key)
+- `user_id` (UUID, Indexed) - References the student
+- `notification_id` (UUID, Foreign Key referencing `notifications(id)`)
+- `is_read` (BOOLEAN, Default: FALSE)
+- `created_at` (TIMESTAMP, Default: CURRENT_TIMESTAMP)
+
+### Scaling Problems & Solutions
+
+As the platform grows, we'll inevitably face data volume challenges:
+
+1. **Table Bloat**: A single admin alert sent to 5,000 students creates 1 row in `notifications` but 5,000 rows in `user_notifications`. This mapping table will rapidly expand into millions of rows.
+   - **Solution**: We should partition the `user_notifications` table by `created_at` (e.g., monthly). Students rarely check old alerts, so keeping recent data in smaller, active partitions drastically improves query speed. Additionally, we can implement a background cron job to archive or delete notifications older than 90 days.
+
+2. **Slow Unread Counts**: Running a `COUNT(*)` query on a massive table for every page load to show the UI badge will degrade performance.
+   - **Solution**: We should introduce a **Redis** caching layer. We can store a simple integer for each user's unread count in Redis, incrementing it when an alert is published and decrementing it when they mark something as read. This avoids hitting the database entirely for the unread badge.
+
+3. **Blocking API Requests**: Trying to synchronously insert 5,000 rows into the database when an admin creates a notification can cause the API to hang and create database bottlenecks.
+   - **Solution**: We must handle the "fan-out" asynchronously. When the admin hits the endpoint, we publish a job to a message broker like **RabbitMQ** or **AWS SQS** and immediately return a success response. Background workers will then pick up the job and safely insert the thousands of `user_notifications` rows in batches.
+
+### SQL Queries (Mapping to Stage 1 APIs)
+
+**1. Fetch Notifications (With filters and pagination)**
+```sql
+SELECT n.id, n.title, n.message, n.category, un.is_read, n.action_url, n.created_at
+FROM notifications n
+JOIN user_notifications un ON n.id = un.notification_id
+WHERE un.user_id = 'current_user_uuid'
+  AND n.category = 'placements' -- Optional filter
+ORDER BY n.created_at DESC
+LIMIT 20 OFFSET 0;
+```
+
+**2. Mark a Single Notification as Read**
+```sql
+UPDATE user_notifications
+SET is_read = TRUE
+WHERE user_id = 'current_user_uuid' 
+  AND notification_id = 'specific_notif_uuid';
+```
+
+**3. Mark All Notifications as Read**
+```sql
+UPDATE user_notifications
+SET is_read = TRUE
+WHERE user_id = 'current_user_uuid' 
+  AND is_read = FALSE;
+```
+
+**4. Get Unread Count** *(Fallback if not using Redis)*
+```sql
+SELECT COUNT(*) AS unread_count
+FROM user_notifications
+WHERE user_id = 'current_user_uuid' 
+  AND is_read = FALSE;
+```
+
+**5. Create a Notification (Admin)**
+```sql
+-- Step 1: Insert the main alert
+INSERT INTO notifications (id, title, message, category, action_url, target_audience)
+VALUES (
+  'notif_123', 
+  'TCS Campus Drive', 
+  'The online assessment link is active.', 
+  'placements', 
+  'https://campus.edu/placements/tcs', 
+  '{"batch": "2025"}'
+);
+
+-- Step 2: The Async Fan-out (Inserting for all matching students)
+INSERT INTO user_notifications (id, user_id, notification_id, is_read)
+SELECT 
+  gen_random_uuid(), 
+  users.id, 
+  'notif_123', 
+  FALSE
+FROM users
+WHERE users.batch = '2025';
+```
