@@ -22,7 +22,7 @@ class MinHeap {
     bubbleUp(index) {
         while (index > 0) {
             let parent = Math.floor((index - 1) / 2);
-            // Min-Heap: parent should be smaller than child
+            
             if (this.heap[parent].priority_score <= this.heap[index].priority_score) break;
             [this.heap[index], this.heap[parent]] = [this.heap[parent], this.heap[index]];
             index = parent;
