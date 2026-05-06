@@ -197,9 +197,10 @@ When an admin creates a notification, the backend determines the `target_audienc
 
 ### Database Selection
 
-For this notification system, I recommend using **PostgreSQL**, a robust relational database. 
+For this notification system, I recommend using **PostgreSQL**, a robust relational database.
 
 **Key Features**
+
 - **ACID Compliance**: It guarantees reliable state transitions, which is crucial when thousands of students are simultaneously marking notifications as read or clearing their inboxes. We cannot afford data anomalies.
 - **Relational Structure**: The platform inherently maps entities (users to their specific notifications). A relational database handles these associations naturally and efficiently.
 - **Flexible JSONB Support**: Notifications can have varying metadata (e.g., dynamic `target_audience` parameters or custom `action_url` structures). PostgreSQL's `JSONB` data type allows us to store these attributes without strict schemas while still keeping them fully indexable and queryable.
@@ -209,6 +210,7 @@ For this notification system, I recommend using **PostgreSQL**, a robust relatio
 We'll use a "fan-out-on-write" approach. Instead of keeping an array of users inside a single notification, we'll have a main table for the notification content and a mapping table that acts as each user's personal inbox.
 
 **1. `notifications` Table:** (Stores the actual broadcasted message)
+
 - `id` (UUID, Primary Key)
 - `title` (VARCHAR)
 - `message` (TEXT)
@@ -218,6 +220,7 @@ We'll use a "fan-out-on-write" approach. Instead of keeping an array of users in
 - `created_at` (TIMESTAMP, Default: CURRENT_TIMESTAMP)
 
 **2. `user_notifications` Table:** (Tracks individual read receipts and acts as the user's feed)
+
 - `id` (UUID, Primary Key)
 - `user_id` (UUID, Indexed) - References the student
 - `notification_id` (UUID, Foreign Key referencing `notifications(id)`)
@@ -229,17 +232,19 @@ We'll use a "fan-out-on-write" approach. Instead of keeping an array of users in
 As the platform grows, we'll inevitably face data volume challenges:
 
 1. **Table Bloat**: A single admin alert sent to 5,000 students creates 1 row in `notifications` but 5,000 rows in `user_notifications`. This mapping table will rapidly expand into millions of rows.
+
    - **Solution**: We should partition the `user_notifications` table by `created_at` (e.g., monthly). Students rarely check old alerts, so keeping recent data in smaller, active partitions drastically improves query speed. Additionally, we can implement a background cron job to archive or delete notifications older than 90 days.
-
 2. **Slow Unread Counts**: Running a `COUNT(*)` query on a massive table for every page load to show the UI badge will degrade performance.
-   - **Solution**: We should introduce a **Redis** caching layer. We can store a simple integer for each user's unread count in Redis, incrementing it when an alert is published and decrementing it when they mark something as read. This avoids hitting the database entirely for the unread badge.
 
+   - **Solution**: We should introduce a **Redis** caching layer. We can store a simple integer for each user's unread count in Redis, incrementing it when an alert is published and decrementing it when they mark something as read. This avoids hitting the database entirely for the unread badge.
 3. **Blocking API Requests**: Trying to synchronously insert 5,000 rows into the database when an admin creates a notification can cause the API to hang and create database bottlenecks.
+
    - **Solution**: We must handle the "fan-out" asynchronously. When the admin hits the endpoint, we publish a job to a message broker like **RabbitMQ** or **AWS SQS** and immediately return a success response. Background workers will then pick up the job and safely insert the thousands of `user_notifications` rows in batches.
 
 ### SQL Queries (Mapping to Stage 1 APIs)
 
 **1. Fetch Notifications (With filters and pagination)**
+
 ```sql
 SELECT n.id, n.title, n.message, n.category, un.is_read, n.action_url, n.created_at
 FROM notifications n
@@ -251,6 +256,7 @@ LIMIT 20 OFFSET 0;
 ```
 
 **2. Mark a Single Notification as Read**
+
 ```sql
 UPDATE user_notifications
 SET is_read = TRUE
@@ -259,6 +265,7 @@ WHERE user_id = 'current_user_uuid'
 ```
 
 **3. Mark All Notifications as Read**
+
 ```sql
 UPDATE user_notifications
 SET is_read = TRUE
@@ -267,6 +274,7 @@ WHERE user_id = 'current_user_uuid'
 ```
 
 **4. Get Unread Count** *(Fallback if not using Redis)*
+
 ```sql
 SELECT COUNT(*) AS unread_count
 FROM user_notifications
@@ -275,6 +283,7 @@ WHERE user_id = 'current_user_uuid'
 ```
 
 **5. Create a Notification (Admin)**
+
 ```sql
 -- Step 1: Insert the main alert
 INSERT INTO notifications (id, title, message, category, action_url, target_audience)
@@ -296,4 +305,147 @@ SELECT
   FALSE
 FROM users
 WHERE users.batch = '2025';
+
+---
+
+## Stage 3
+
+### Database Query Analysis & Optimization
+
+#### Context
+
+The relational database (MySQL/PostgreSQL) has scaled to **50,000 students** and **5,000,000 notifications**. The following query, written to fetch all unread notifications for a student, is now performing slowly:
+
+```sql
+SELECT * FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt DESC;
+```
+
+---
+
+### 1. Is This Query Accurate?
+
+The query is **functionally correct** — it does retrieve the right data. However, it has two significant problems:
+
+- **`SELECT *`**: This selects every column in the table, including large `TEXT` fields like `message` or `JSONB` blobs. This unnecessarily increases I/O, network transfer, and memory usage. Best practice is to **select only the columns the API actually needs** (e.g., `id`, `title`, `message`, `isRead`, `createdAt`).
+- **Schema mismatch with Stage 2 design**: The Stage 2 schema uses a two-table design (`notifications` + `user_notifications`) to separate notification content from per-user read status. This single-table query implies a denormalized design where `studentID` and `isRead` live directly on the `notifications` table — which would cause massive data duplication (one row per student per notification). At 5,000,000 rows for 50,000 students, this is the expected outcome of that anti-pattern.
+
+---
+
+### 2. Why Is This Query Slow?
+
+With 5,000,000 rows and no indexes, the database performs a **Full Table Scan** — it reads every single row to find matches. Here's the breakdown:
+
+| Root Cause                            | Explanation                                                                                                                                        |
+| ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **No index on `studentID`**   | The DB cannot jump to student 1042's rows; it scans all 5M rows.                                                                                   |
+| **No index on `isRead`**      | Even after filtering by `studentID`, filtering unread rows requires checking each row individually.                                              |
+| **`ORDER BY createdAt DESC`** | Without an index covering the sort column, the DB must load all matching rows into memory, sort them in-place (filesort), and then return results. |
+| **`SELECT *`**                | Fetches all columns, increasing data read from disk per row (especially TEXT/JSONB fields).                                                        |
+
+**Estimated Computation Cost (without indexes):**
+
+- The query planner performs a sequential scan over **~5,000,000 rows**.
+- For a student with, say, **200 unread notifications**, it reads 5M rows to find 200 — an efficiency of **0.004%**.
+- Time complexity: **O(N)** where N = total rows = 5,000,000.
+- On a typical server, this translates to **hundreds of milliseconds to several seconds** per API call.
+
+---
+
+### 3. What Would You Change?
+
+#### Fix 1: Create a Composite Index
+
+The most impactful change is adding a **composite index** that covers all three parts of the query — the filter columns and the sort column:
+
+```sql
+-- For PostgreSQL
+CREATE INDEX idx_notifications_student_read_created
+ON notifications (studentID, isRead, createdAt DESC);
+```
+
+**Why this works:**
+
+- The DB uses the index to **instantly locate** rows for `studentID = 1042`.
+- Within those rows, it then filters `isRead = false` using the index (no row-by-row scan).
+- The `createdAt DESC` is already ordered within the index, so **no filesort is needed**.
+- Time complexity drops from **O(N)** to approximately **O(log N + K)**, where K is the number of matching unread notifications for that student.
+
+#### Fix 2: Replace `SELECT *` with Specific Columns
+
+```sql
+SELECT id, title, message, isRead, createdAt
+FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt DESC;
+```
+
+This reduces the volume of data transferred from disk and over the network per query.
+
+#### Fix 3: Add Pagination
+
+Without a `LIMIT`, the query could return thousands of rows in a single response. Always paginate:
+
+```sql
+SELECT id, title, message, isRead, createdAt
+FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt DESC
+LIMIT 20 OFFSET 0;
+```
+
+**Estimated Cost After Optimization:**
+
+- Index lookup: **O(log 5,000,000) ≈ ~23 comparisons** to reach the B-tree leaf node.
+- Index scan for unread rows: reads only the student's unread entries (~200 rows vs. 5M).
+- No filesort; results are pre-ordered in the index.
+- Expected query time: **< 5 milliseconds** — a **100x to 1000x improvement**.
+
+---
+
+### 4. Is Adding Indexes on Every Column a Good Idea?
+
+**No. This is ineffective and actively harmful.** Here's why:
+
+| Concern                                        | Detail                                                                                                                                                                                                                                                     |
+| ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Write performance degrades**           | Every `INSERT`, `UPDATE`, or `DELETE` must also update *all* indexes on that table. With 10+ indexes, writes become significantly slower. In a notification system that inserts thousands of rows during a fan-out, this is a critical bottleneck. |
+| **Increased disk usage**                 | Each index is stored as a separate B-tree data structure on disk. Indexing every column on a 5M-row table can consume gigabytes of additional storage.                                                                                                     |
+| **Query planner confusion**              | The database query planner must evaluate all available indexes to pick the best one. Too many indexes can actually lead to suboptimal query plans or unnecessary overhead in planning.                                                                     |
+| **Low-cardinality columns are wasteful** | A column like `isRead` has only 2 possible values (`true`/`false`). A standalone index on it is near-useless because half the table matches either value — the DB would still scan most rows.                                                       |
+| **Composite index is superior**          | A single well-designed composite index on `(studentID, isRead, createdAt DESC)` outperforms three separate indexes on each column individually, because it covers the entire query in one index traversal.                                               |
+
+**The right approach** is **selective, query-driven indexing**: analyze the most frequent and slowest queries, then create targeted indexes that satisfy those exact access patterns.
+
+---
+
+### 5. Query: All Students Who Received a Placement Notification in the Last 7 Days
+
+Given the table has a `notificationType` column using a `notification_type` enum (`'Event'`, `'Result'`, `'Placement'`):
+
+```sql
+SELECT DISTINCT studentID
+FROM notifications
+WHERE notificationType = 'Placement'
+  AND createdAt >= NOW() - INTERVAL '7 days';
+```
+
+**Explanation:**
+
+- `notificationType = 'Placement'` — filters using the enum value to match only placement alerts.
+- `createdAt >= NOW() - INTERVAL '7 days'` — restricts results to notifications created within the last 7 days. Use `INTERVAL 7 DAY` in MySQL syntax instead.
+- `SELECT DISTINCT studentID` — ensures each student appears only once, even if they received multiple placement notifications in the window.
+
+**Recommended Supporting Index:**
+
+```sql
+CREATE INDEX idx_notifications_type_created
+ON notifications (notificationType, createdAt DESC);
+```
+
+This allows the DB to efficiently filter by type and scan only the recent time window, avoiding a full table scan on 5,000,000 rows.
+
+```
+
 ```
